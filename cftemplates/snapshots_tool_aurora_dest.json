@@ -1,0 +1,613 @@
+{
+	"AWSTemplateFormatVersion": "2010-09-09",
+	"Parameters": {
+		"CodeBucket": {
+			"Type": "String",
+			"Description": "Name of the bucket that contains the lambda functions to deploy. Leave the default value to download the code from the AWS Managed buckets"
+		},
+		"SnapshotPattern": {
+			"Type": "String",
+			"Default": "ALL_SNAPSHOTS",
+			"Description": "Python regex for matching cluster identifiers to backup. Use \"ALL_SNAPSHOTS\" to back up every Aurora cluster in the region."
+		},
+		"RetentionDays": {
+			"Type": "Number",
+			"Default": "7",
+			"Description": "Number of days to keep snapshots in retention before deleting them"
+		},
+		"DestinationRegion": {
+			"Type": "String",
+			"Description": "Destination region for snapshots."
+		},
+		"LogLevel": {
+			"Type": "String",
+			"Default": "ERROR",
+			"Description": "Log level for Lambda functions (DEBUG, INFO, WARN, ERROR, CRITICAL are valid values)."
+		},
+		"SourceRegionOverride": {
+			"Type": "String",
+			"Default": "NO",
+			"Description": "Set to the region where your Aurora clusters run, only if such region does not support Step Functions. Leave as NO otherwise"
+		},
+		"KmsKeyDestination": {
+			"Type": "String",
+			"Default": "None",
+			"Description": "Set to the KMS Key Id in the destination region to re-encrypt encrypted snapshots. Leave None if you are not using encryption"
+		},
+		"KmsKeySource": {
+			"Type": "String",
+			"Default": "None",
+			"Description": "Set to the KMS Key Id in the SOURCE region to re-encrypt encrypted snapshots. Leave None if you are not using encryption"
+		},
+		"DeleteOldSnapshots": {
+			"Type": "String",
+			"Default": "TRUE",
+			"Description": "Set to TRUE to enable deletion of snapshot based on RetentionDays. Set to FALSE to disable",
+			"AllowedValues": ["TRUE", "FALSE"]
+		},
+		"CrossAccountCopy": {
+			"Type": "String",
+			"AllowedValues": ["TRUE", "FALSE"],
+			"Default": "TRUE",
+			"Description": "Enable copying snapshots across accounts. Set to FALSE if your source snapshosts are not on a different account"
+		},
+		"SNSTopic": {
+			"Type": "String",
+			"Default": "",
+			"Description": "If you have a topic that you would like subscribed to notifications, enter it here. If empty, the tool will create a new topic"
+		}
+	},
+	"Conditions": {
+		"DeleteOld": {
+			"Fn::Equals": [{
+				"Ref": "DeleteOldSnapshots"
+			}, "TRUE"]
+		},
+		"CrossAccount": {
+			"Fn::Equals": [{
+				"Ref": "CrossAccountCopy"
+			}, "TRUE"]
+		},
+		"SNSTopicIsEmpty": {
+			"Fn::Equals": [{
+				"Ref": "SNSTopic"
+			}, ""]
+		},
+		"RegionOverridden": {
+			"Fn::Not": [{
+				"Fn::Equals": [{
+					"Ref": "SourceRegionOverride"
+				}, "NO"]
+			}]
+
+
+		}
+	},
+	"Resources": {
+		"snsTopicSnapshotsAuroraToolDest": {
+			"Condition": "SNSTopicIsEmpty",
+			"Type": "AWS::SNS::Topic",
+			"Properties": {
+				"DisplayName": "topic_aurora_tool_dest"
+			}
+		},
+		"snspolicySnapshotsAuroraDest": {
+			"Condition": "SNSTopicIsEmpty",
+			"Type": "AWS::SNS::TopicPolicy",
+			"Properties": {
+				"Topics": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"PolicyDocument": {
+					"Version": "2008-10-17",
+					"Id": "__default_policy_ID",
+					"Statement": [{
+						"Effect": "Allow",
+						"Principal": {
+							"AWS": "*"
+						},
+						"Action": [
+							"SNS:GetTopicAttributes",
+							"SNS:SetTopicAttributes",
+							"SNS:AddPermission",
+							"SNS:RemovePermission",
+							"SNS:DeleteTopic",
+							"SNS:Subscribe",
+							"SNS:ListSubscriptionsByTopic",
+							"SNS:Publish",
+							"SNS:Receive"
+						],
+						"Resource": "*",
+						"Condition": {
+							"StringEquals": {
+								"AWS:SourceOwner": {
+									"Ref": "AWS::AccountId"
+								}
+							}
+						}
+					}]
+				}
+			}
+		},
+		"alarmcwCopyFailedDest": {
+			"Type": "AWS::CloudWatch::Alarm",
+			"Properties": {
+				"AlarmDescription": "DB Copy to destination status",
+				"ActionsEnabled": "true",
+				"ComparisonOperator": "GreaterThanOrEqualToThreshold",
+				"EvaluationPeriods": "1",
+				"MetricName": "ExecutionsFailed",
+				"Namespace": "AWS/States",
+				"Period": "300",
+				"Statistic": "Sum",
+				"Threshold": "2.0",
+				"TreatMissingData": "ignore",
+				"AlarmActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"OKActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"InsufficientDataActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"Dimensions": [{
+					"Name": "StateMachineArn",
+					"Value": {
+						"Ref": "statemachineCopySnapshotsDestAurora"
+					}
+				}]
+			}
+		},
+		"alarmcwDeleteOldFailedDest": {
+			"Type": "AWS::CloudWatch::Alarm",
+			"Condition": "DeleteOld",
+			"Properties": {
+				"AlarmDescription": "Failed to delete old snapshots from destination",
+				"ActionsEnabled": "true",
+				"ComparisonOperator": "GreaterThanOrEqualToThreshold",
+				"EvaluationPeriods": "2",
+				"MetricName": "ExecutionsFailed",
+				"Namespace": "AWS/States",
+				"Period": "3600",
+				"Statistic": "Sum",
+				"Threshold": "2.0",
+				"AlarmActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"OKActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"InsufficientDataActions": [{
+					"Fn::If": ["SNSTopicIsEmpty", {
+						"Ref": "snsTopicSnapshotsAuroraToolDest"
+					}, {
+						"Ref": "SNSTopic"
+					}]
+				}],
+				"Dimensions": [{
+					"Name": "StateMachineArn",
+					"Value": {
+						"Ref": "statemachineDeleteOldSnapshotsDestAurora"
+					}
+				}]
+			}
+		},
+		"iamroleSnapshotsAurora": {
+			"Type": "AWS::IAM::Role",
+			"Properties": {
+				"AssumeRolePolicyDocument": {
+					"Version": "2012-10-17",
+					"Statement": [{
+						"Effect": "Allow",
+						"Principal": {
+							"Service": "lambda.amazonaws.com"
+						},
+						"Action": "sts:AssumeRole"
+					}]
+				},
+				"ManagedPolicyArns": ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"],
+				"Policies": [{
+					"PolicyName": "inline_policy_snapshots_aurora_rds",
+					"PolicyDocument": {
+						"Version": "2012-10-17",
+						"Statement": [{
+							"Effect": "Allow",
+							"Action": [
+								"rds:DescribeDBClusters",
+								"rds:DescribeDBClusterSnapshots"
+							],
+							"Resource": "*"
+						},
+							{
+								"Effect": "Allow",
+								"Action": [
+									"rds:CreateDBClusterSnapshot",
+									"rds:DeleteDBClusterSnapshot",
+									"rds:ModifyDBClusterSnapshotAttribute",
+									"rds:CopyDBClusterSnapshot",
+									"rds:DescribeDBClusterSnapshotAttributes",
+									"rds:ListTagsForResource",
+									"rds:AddTagsToResource"
+								],
+								"Resource": [
+									"arn:aws:rds:*:*:cluster:*",
+									"arn:aws:rds:*:*:cluster-snapshot:*"
+								]
+
+							}
+						]
+					}
+
+				},
+					{
+						"PolicyName": "inline_policy_snapshots_aurora_kms_access",
+						"PolicyDocument": {
+							"Version": "2012-10-17",
+							"Statement": [{
+								"Sid": "AllowUseOfTheKey",
+								"Effect": "Allow",
+								"Action": [
+									"kms:Encrypt",
+									"kms:Decrypt",
+									"kms:ReEncrypt*",
+									"kms:GenerateDataKey*",
+									"kms:DescribeKey"
+								],
+								"Resource": [
+									"arn:aws:kms:*:*:key/*"
+								]
+							},
+								{
+									"Sid": "AllowAttachmentOfPersistentResources",
+									"Effect": "Allow",
+									"Action": [
+										"kms:CreateGrant",
+										"kms:ListGrants",
+										"kms:RevokeGrant"
+									],
+									"Resource": [
+										"arn:aws:kms:*:*:key/*"
+									],
+									"Condition": {
+										"Bool": {
+											"kms:GrantIsForAWSResource": true
+										}
+									}
+								}
+							]
+						}
+					}
+				]
+			}
+		},
+		"lambdaCopySnapshotsAurora": {
+			"Type": "AWS::Lambda::Function",
+			"Properties": {
+				"Code": {
+					"S3Bucket": {
+							"Ref": "CodeBucket"
+					},
+					"S3Key": {
+						"Fn::If": ["CrossAccount", "copy_snapshots_dest_aurora.zip", "copy_snapshots_no_x_account_aurora.zip"]
+					}
+				},
+				"Description": "This functions copies snapshots for Aurora clusters shared with this account. It checks for existing snapshots following the pattern specified in the environment variables with the following format: <dbcluster-identifier>-YYYY-MM-DD-HH-MM",
+				"MemorySize": 512,
+				"Environment": {
+					"Variables": {
+						"SNAPSHOT_PATTERN": {
+							"Ref": "SnapshotPattern"
+						},
+						"DEST_REGION": {
+							"Ref": "DestinationRegion"
+						},
+						"LOG_LEVEL": {
+							"Ref": "LogLevel"
+						},
+						"REGION_OVERRIDE": {
+							"Ref": "SourceRegionOverride"
+						},
+						"KMS_KEY_DEST_REGION": {
+							"Ref": "KmsKeyDestination"
+						},
+						"KMS_KEY_SOURCE_REGION": {
+							"Ref": "KmsKeySource"
+						},
+						"RETENTION_DAYS": {
+							"Ref": "RetentionDays"
+						}
+					}
+				},
+				"Role": {
+					"Fn::GetAtt": ["iamroleSnapshotsAurora", "Arn"]
+				},
+				"Runtime": "python3.7",
+				"Handler": "lambda_function.lambda_handler",
+				"Timeout": 300
+			}
+		},
+		"lambdaDeleteOldDestAurora": {
+			"Type": "AWS::Lambda::Function",
+			"Condition": "DeleteOld",
+			"Properties": {
+				"Code": {
+					"S3Bucket": {
+							"Ref": "CodeBucket"
+					},
+					"S3Key": {
+						"Fn::If": ["CrossAccount", "delete_old_snapshots_dest_aurora.zip", "delete_old_snapshots_no_x_account_aurora.zip"]
+					}
+				},
+				"Description": "This function enforces retention on the snapshots shared with the destination account.",
+				"MemorySize": 512,
+				"Environment": {
+					"Variables": {
+						"SNAPSHOT_PATTERN": {
+							"Ref": "SnapshotPattern"
+						},
+						"DEST_REGION": {
+							"Ref": "DestinationRegion"
+						},
+						"RETENTION_DAYS": {
+							"Ref": "RetentionDays"
+						},
+						"LOG_LEVEL": {
+							"Ref": "LogLevel"
+						}
+					}
+				},
+				"Role": {
+					"Fn::GetAtt": ["iamroleSnapshotsAurora", "Arn"]
+				},
+				"Runtime": "python3.7",
+				"Handler": "lambda_function.lambda_handler",
+				"Timeout": 300
+			}
+		},
+		"iamroleStateExecution": {
+			"Type": "AWS::IAM::Role",
+			"Properties": {
+				"AssumeRolePolicyDocument": {
+					"Version": "2012-10-17",
+					"Statement": [{
+						"Effect": "Allow",
+						"Principal": {
+							"Service": {
+								"Fn::Join": ["", ["states.", {
+									"Ref": "AWS::Region"
+								}, ".amazonaws.com"]]
+							}
+						},
+						"Action": "sts:AssumeRole"
+					}]
+				},
+				"Policies": [{
+					"PolicyName": "inline_policy_aurora_snapshot",
+					"PolicyDocument": {
+						"Version": "2012-10-17",
+						"Statement": [{
+							"Effect": "Allow",
+							"Action": [
+								"lambda:InvokeFunction"
+							],
+							"Resource": [{
+								"Fn::GetAtt": ["lambdaCopySnapshotsAurora", "Arn"]
+							}, {
+								"Fn::GetAtt": ["lambdaDeleteOldDestAurora", "Arn"]
+							}]
+
+						}]
+					}
+				}]
+			}
+		},
+		"statemachineCopySnapshotsDestAurora": {
+			"Type": "AWS::StepFunctions::StateMachine",
+			"Properties": {
+				"DefinitionString": {
+					"Fn::Join": ["", [{
+						"Fn::Join": ["\n", [
+							" {\"Comment\":\"Copies snapshots locally and then to DEST_REGION\",",
+							" \"StartAt\":\"CopySnapshots\",",
+							" \"States\":{",
+							"   \"CopySnapshots\":{",
+							"     \"Type\":\"Task\",",
+							"     \"Resource\": "
+						]]
+					},
+						"\"",
+						{
+							"Fn::GetAtt": ["lambdaCopySnapshotsAurora", "Arn"]
+						}, "\"\n,",
+						{
+							"Fn::Join": ["\n", [
+								"     \"Retry\":[",
+								"       {",
+								"       \"ErrorEquals\":[ ",
+								"         \"SnapshotToolException\"",
+								"       ],",
+								"       \"IntervalSeconds\":300,",
+								"       \"MaxAttempts\":5,",
+								"       \"BackoffRate\":1",
+								"     },",
+								"     {",
+								"      \"ErrorEquals\":[ ",
+								"         \"States.ALL\"], ",
+								"         \"IntervalSeconds\": 30,",
+								"         \"MaxAttempts\": 20,",
+								"         \"BackoffRate\": 1",
+								"     }",
+								"    ],",
+								"    \"End\": true ",
+								"   }",
+								" }}"
+							]]
+						}
+					]]
+				},
+				"RoleArn": {
+					"Fn::GetAtt": ["iamroleStateExecution", "Arn"]
+				}
+			}
+		},
+		"statemachineDeleteOldSnapshotsDestAurora": {
+			"Type": "AWS::StepFunctions::StateMachine",
+			"Condition": "DeleteOld",
+			"Properties": {
+				"DefinitionString": {
+					"Fn::Join": ["", [{
+						"Fn::Join": ["\n", [
+							" {\"Comment\":\"DeleteOld for Aurora snapshots in destination region\",",
+							" \"StartAt\":\"DeleteOldDestRegion\",",
+							" \"States\":{",
+							"   \"DeleteOldDestRegion\":{",
+							"     \"Type\":\"Task\",",
+							"     \"Resource\": "
+						]]
+					},
+						"\"",
+						{
+							"Fn::GetAtt": ["lambdaDeleteOldDestAurora", "Arn"]
+						}, "\"\n,",
+						{
+							"Fn::Join": ["\n", [
+								"     \"Retry\":[",
+								"       {",
+								"       \"ErrorEquals\":[ ",
+								"         \"SnapshotToolException\"",
+								"       ],",
+								"       \"IntervalSeconds\":600,",
+								"       \"MaxAttempts\":3,",
+								"       \"BackoffRate\":1",
+								"     },",
+								"     {",
+								"      \"ErrorEquals\":[ ",
+								"         \"States.ALL\"], ",
+								"         \"IntervalSeconds\": 30,",
+								"         \"MaxAttempts\": 20,",
+								"         \"BackoffRate\": 1",
+								"    }",
+								"    ],",
+								"    \"End\": true ",
+								"   }",
+								" }}"
+							]]
+						}
+					]]
+				},
+				"RoleArn": {
+					"Fn::GetAtt": ["iamroleStateExecution", "Arn"]
+				}
+			}
+		},
+		"iamroleStepInvocation": {
+			"Type": "AWS::IAM::Role",
+			"Properties": {
+				"AssumeRolePolicyDocument": {
+					"Version": "2012-10-17",
+					"Statement": [{
+						"Effect": "Allow",
+						"Principal": {
+							"Service": "events.amazonaws.com"
+						},
+						"Action": "sts:AssumeRole"
+					}]
+				},
+				"Policies": [{
+					"PolicyName": "inline_policy_state_invocation",
+					"PolicyDocument": {
+						"Version": "2012-10-17",
+						"Statement": [{
+							"Effect": "Allow",
+							"Action": [
+								"states:StartExecution"
+							],
+							"Resource": [{
+								"Ref": "statemachineCopySnapshotsDestAurora"
+							}, {
+								"Ref": "statemachineDeleteOldSnapshotsDestAurora"
+							}]
+						}]
+					}
+				}]
+			}
+		},
+		"cwEventCopySnapshotsAurora": {
+			"Type": "AWS::Events::Rule",
+			"Properties": {
+				"Description": "Triggers the Aurora Copy state machine in the destination account",
+				"ScheduleExpression": {
+					"Fn::Join": ["", ["cron(", "/30 * * * ? *", ")"]]
+				},
+				"State": "ENABLED",
+				"Targets": [{
+					"Arn": {
+						"Ref": "statemachineCopySnapshotsDestAurora"
+					},
+					"Id": "Target1",
+					"RoleArn": {
+						"Fn::GetAtt": ["iamroleStepInvocation", "Arn"]
+					}
+				}]
+			}
+		},
+		"cwEventDeleteOldSnapshotsAurora": {
+			"Type": "AWS::Events::Rule",
+			"Condition": "DeleteOld",
+			"Properties": {
+				"Description": "Triggers the Aurora DeleteOld state machine in the destination account",
+				"ScheduleExpression": {
+					"Fn::Join": ["", ["cron(", "0 /1 * * ? *", ")"]]
+				},
+				"State": "ENABLED",
+				"Targets": [{
+					"Arn": {
+						"Ref": "statemachineDeleteOldSnapshotsDestAurora"
+					},
+					"Id": "Target1",
+					"RoleArn": {
+						"Fn::GetAtt": ["iamroleStepInvocation", "Arn"]
+					}
+				}]
+			}
+		}
+	},
+	"Outputs": {
+		"SNSTopic": {
+			"Description": "Subscribe to this topic to receive alerts of failures with the snapshots tool",
+			"Value": {
+				"Fn::If": ["SNSTopicIsEmpty", {
+					"Ref": "snsTopicSnapshotsAuroraToolDest"
+				}, {
+					"Ref": "SNSTopic"
+				}]
+			}
+		}
+	},
+	"Description": "Snapshots for Aurora cross-region and cross-account (destination account stack)"
+}
